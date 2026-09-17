@@ -1,0 +1,24 @@
+{
+  "_comment": "Send a fixed amount and return the change. Fee is computed from fee_rate.",
+  "network": "mainnet",
+  "version": 2,
+  "locktime": 0,
+
+  "key": "PUT-YOUR-WIF-OR-HEX-PRIVATE-KEY-HERE",
+
+  "inputs": [
+    {
+      "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+      "vout": 0,
+      "amount_sat": 250000,
+      "address": "bc1q-the-address-this-utxo-pays-to"
+    }
+  ],
+
+  "outputs": [
+    { "address": "bc1q-where-you-are-sending", "amount_sat": 100000 }
+  ],
+
+  "change_address": "bc1q-your-own-change-address",
+  "fee_rate": 8
+}

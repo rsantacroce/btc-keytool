@@ -1,0 +1,21 @@
+{
+  "_comment": "Sweep several UTXOs of different types into one address. amount_sat 'all' takes whatever is left after the fee.",
+  "network": "mainnet",
+
+  "inputs": [
+    { "txid": "aaaa...", "vout": 0, "amount_sat": 40000,
+      "address": "1YourLegacyAddress...", "key": "WIF-for-this-input" },
+
+    { "txid": "bbbb...", "vout": 1, "amount_sat": 65000,
+      "address": "bc1qyoursegwitaddress...", "key": "WIF-for-this-input" },
+
+    { "txid": "cccc...", "vout": 0, "amount_sat": 120000,
+      "address": "bc1pyourtaprootaddress...", "key": "WIF-for-this-input" }
+  ],
+
+  "outputs": [
+    { "address": "bc1q-destination", "amount_sat": "all" }
+  ],
+
+  "fee_rate": 5
+}
