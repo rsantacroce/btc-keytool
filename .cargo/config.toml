@@ -1,0 +1,7 @@
+# Windows (MSVC) only.
+# The bitcoinconsensus crate builds its bundled libsecp256k1 as a static library but does not
+# define SECP256K1_STATIC for the C++ code that calls it, so MSVC emits DLL imports
+# (__imp_secp256k1_*) and the final link fails with LNK2019. Defining it here fixes the link.
+[env]
+CXXFLAGS_x86_64_pc_windows_msvc = "/DSECP256K1_STATIC"
+CXXFLAGS_aarch64_pc_windows_msvc = "/DSECP256K1_STATIC"
