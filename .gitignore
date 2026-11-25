@@ -1,8 +1,13 @@
+# build output
+target/
+src-tauri/gen/
 __pycache__/
 *.pyc
+.playwright-mcp/
 
-# never commit keys or signed transactions
+# never commit keys, signed transactions or PSBTs
 *.hex
+*.psbt
 key.txt
 keys.txt
 *.key

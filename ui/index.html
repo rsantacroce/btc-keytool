@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BTC Keytool</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>BTC Keytool</h1>
+    <span class="pill">offline &middot; nothing is ever broadcast</span>
+    <label class="net">network
+      <select id="network">
+        <option>mainnet</option><option>testnet</option><option>signet</option><option>regtest</option>
+      </select>
+    </label>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="key" class="on">Key</button>
+    <button data-tab="addr">Address</button>
+    <button data-tab="multisig">Multisig</button>
+    <button data-tab="build">Build &amp; sign</button>
+    <button data-tab="sign">Sign PSBT</button>
+    <button data-tab="combine">Combine</button>
+    <button data-tab="verify">Verify</button>
+    <button data-tab="decode">Decode</button>
+    <button data-tab="msg">Message</button>
+    <button data-tab="selftest">Self-test</button>
+  </nav>
+
+  <main>
+    <section id="key" class="on">
+      <p class="hint">Derive the public key and every address from a private key. A key owns all five addresses at once.</p>
+      <label>Private key <small>WIF, 64-char hex, 0x-hex or decimal</small>
+        <input id="key-in" class="secret mono" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="row">
+        <button class="go" data-act="key">Derive</button>
+        <button data-act="newkey">Generate a new key</button>
+        <label class="check"><input type="checkbox" data-reveal="key"> show key</label>
+      </div>
+      <div class="out" id="key-out"></div>
+    </section>
+
+    <section id="addr">
+      <p class="hint">Inspect an address (script, type, dust limit) or a public key (every address it controls).</p>
+      <label>Address or public key <input id="addr-in" class="mono" autocomplete="off" spellcheck="false"></label>
+      <div class="row"><button class="go" data-act="addr">Inspect</button></div>
+      <div class="out" id="addr-out"></div>
+    </section>
+
+    <section id="multisig">
+      <p class="hint">Create a k-of-n multisig address from the cosigners' public keys. Only public keys are needed here.
+        Every cosigner should build it independently and compare the address before funding it.</p>
+      <label>Public keys <small>one compressed key per line</small>
+        <textarea id="ms-keys" class="mono" rows="5" spellcheck="false"></textarea>
+      </label>
+      <div class="row">
+        <label>Signatures required <input id="ms-k" type="number" min="1" max="20" value="2"></label>
+        <label>Type
+          <select id="ms-type">
+            <option value="p2wsh">P2WSH - native segwit (bc1q…)</option>
+            <option value="p2sh-p2wsh">P2SH-P2WSH - nested segwit (3…)</option>
+            <option value="p2sh">P2SH - legacy (3…)</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="ms-sorted" checked> sort keys (BIP67)</label>
+      </div>
+      <div class="row"><button class="go" data-act="multisig">Create address</button></div>
+      <div class="out" id="multisig-out"></div>
+    </section>
+
+    <section id="build" class="reveal">
+      <p class="hint">Build a transaction from a JSON spec and sign it with the keys in the spec. If signatures are still
+        missing (multisig, or no key given) you get a PSBT to pass on instead of a transaction.</p>
+      <div class="row">
+        <button data-example="single">Example: single key</button>
+        <button data-example="sweep">Example: sweep</button>
+        <button data-example="multisig">Example: 2-of-3 multisig</button>
+        <label class="check"><input type="checkbox" data-reveal="build" checked> show spec (it may contain keys)</label>
+      </div>
+      <label>Spec
+        <textarea id="build-in" class="secret mono" rows="16" spellcheck="false"></textarea>
+      </label>
+      <div class="row">
+        <button class="go" data-act="build">Build &amp; sign</button>
+        <label class="check"><input type="checkbox" id="build-force"> allow an unusually large fee</label>
+      </div>
+      <div class="out" id="build-out"></div>
+    </section>
+
+    <section id="sign">
+      <p class="hint">Add your signature to a partially signed transaction. Review the outputs and the fee below before
+        passing it on: you are authorising exactly that payment.</p>
+      <label>PSBT <small>base64 or hex</small>
+        <textarea id="sign-psbt" class="mono" rows="6" spellcheck="false"></textarea>
+      </label>
+      <label>Private key(s) <small>one per line</small>
+        <textarea id="sign-keys" class="secret mono" rows="2" spellcheck="false" autocomplete="off"></textarea>
+      </label>
+      <div class="row">
+        <button data-act="sign-review">Review PSBT</button>
+        <button class="go" data-act="sign">Sign</button>
+        <label class="check"><input type="checkbox" data-reveal="sign"> show keys</label>
+      </div>
+      <div class="out" id="sign-out"></div>
+    </section>
+
+    <section id="combine">
+      <p class="hint">Merge PSBTs of the same transaction that cosigners signed separately.</p>
+      <label>PSBTs <small>one per line</small>
+        <textarea id="combine-in" class="mono" rows="8" spellcheck="false"></textarea>
+      </label>
+      <div class="row"><button class="go" data-act="combine">Combine</button></div>
+      <div class="out" id="combine-out"></div>
+    </section>
+
+    <section id="verify">
+      <p class="hint">Verify every signature of a signed transaction or a PSBT. A raw transaction needs the spec it was
+        built from, because signatures commit to the amounts being spent and the transaction does not contain them.</p>
+      <label>Raw transaction hex or PSBT
+        <textarea id="verify-in" class="mono" rows="6" spellcheck="false"></textarea>
+      </label>
+      <label>Spec <small>only for a raw transaction; private keys in it are ignored</small>
+        <textarea id="verify-spec" class="mono" rows="6" spellcheck="false"></textarea>
+      </label>
+      <div class="row"><button class="go" data-act="verify">Verify</button></div>
+      <div class="out" id="verify-out"></div>
+    </section>
+
+    <section id="decode">
+      <p class="hint">Decode a raw transaction or a PSBT.</p>
+      <label>Raw transaction hex or PSBT
+        <textarea id="decode-in" class="mono" rows="6" spellcheck="false"></textarea>
+      </label>
+      <div class="row"><button class="go" data-act="decode">Decode</button></div>
+      <div class="out" id="decode-out"></div>
+    </section>
+
+    <section id="msg">
+      <p class="hint">Sign a text message with a key, or check someone else's signature. A signature is verified before it is shown.</p>
+      <label>Message <textarea id="msg-text" rows="3" spellcheck="false"></textarea></label>
+      <h3>Sign</h3>
+      <label>Private key <input id="msg-key" class="secret mono" autocomplete="off" spellcheck="false"></label>
+      <label>Address to sign for <small>optional; one of the key's own, default P2PKH</small>
+        <input id="msg-addr" class="mono" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="row">
+        <button class="go" data-act="msg-sign">Sign message</button>
+        <label class="check"><input type="checkbox" data-reveal="msg"> show key</label>
+      </div>
+      <h3>Verify</h3>
+      <label>Signer's address <input id="msg-vaddr" class="mono" autocomplete="off" spellcheck="false"></label>
+      <label>Signature <small>base64</small> <input id="msg-sig" class="mono" autocomplete="off" spellcheck="false"></label>
+      <div class="row"><button class="go" data-act="msg-verify">Verify signature</button></div>
+      <div class="out" id="msg-out"></div>
+    </section>
+
+    <section id="selftest">
+      <p class="hint">Run the built-in test vectors on this machine: official BIP vectors, every input type signed and
+        verified, multisig flows, and tamper detection.</p>
+      <div class="row"><button class="go" data-act="selftest">Run self-test</button></div>
+      <div class="out" id="selftest-out"></div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

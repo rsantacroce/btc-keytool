@@ -1,0 +1,15 @@
+[package]
+name = "btc-keytool"
+description = "Offline Bitcoin key, multisig and transaction tool"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "btc-keytool"
+path = "src/main.rs"
+
+[dependencies]
+btc-keytool-core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
