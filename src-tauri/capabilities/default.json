@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The window may call this app's own commands and nothing else: no filesystem, shell, HTTP or window APIs are granted.",
+  "windows": ["main"],
+  "permissions": []
+}

@@ -1,0 +1,13 @@
+[package]
+name = "btc-keytool-app"
+description = "Offline Bitcoin key, multisig and transaction tool (desktop app)"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+btc-keytool-core = { path = "../crates/core" }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }

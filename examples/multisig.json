@@ -1,0 +1,30 @@
+{
+  "_comment": "Spend from a 2-of-3 multisig. List the private keys you hold under 'keys' (or none at all). With fewer than 2 you get a PSBT to hand to the next cosigner: btc-keytool sign <psbt> --key-file <key>",
+  "network": "mainnet",
+
+  "keys": ["PUT-YOUR-WIF-OR-HEX-PRIVATE-KEY-HERE"],
+
+  "inputs": [
+    {
+      "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+      "vout": 0,
+      "amount_sat": 500000,
+      "address": "bc1q-the-multisig-address",
+      "multisig": {
+        "threshold": 2,
+        "pubkeys": [
+          "02-compressed-public-key-of-cosigner-1",
+          "03-compressed-public-key-of-cosigner-2",
+          "02-compressed-public-key-of-cosigner-3"
+        ]
+      }
+    }
+  ],
+
+  "outputs": [
+    { "address": "bc1q-where-you-are-sending", "amount_sat": 120000 }
+  ],
+
+  "change_address": "bc1q-the-multisig-address",
+  "fee_rate": 10
+}

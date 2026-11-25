@@ -1,0 +1,14 @@
+[package]
+name = "btc-keytool-core"
+description = "Offline Bitcoin key, multisig and transaction signing library"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoin = { workspace = true }
+bitcoinconsensus = "0.106"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+miniscript = "12"
