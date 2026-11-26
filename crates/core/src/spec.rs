@@ -10,13 +10,16 @@ use bitcoin::transaction::Version;
 use bitcoin::{
     Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
 };
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::keys::{parse_key, parse_pubkey};
+use crate::keys::{parse_compressed_pubkey, parse_key};
 use crate::script::{classify_input, dust_threshold, parse_address, Multisig, Wrap};
-use crate::sign::{estimate_vsize, outcome, sign_input, Outcome};
-use crate::{parse_network, unhx, Result};
+use crate::sign::{
+    check_fee, check_shape, estimate_vsize, outcome_for, sign_input, Outcome, Policy,
+};
+use crate::{parse_network, sum_sats, unhx, Result};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,7 +78,7 @@ impl MultisigSpec {
         let keys = self
             .pubkeys
             .iter()
-            .map(|p| parse_pubkey(p))
+            .map(|p| parse_compressed_pubkey(p))
             .collect::<Result<Vec<_>>>()?;
         Multisig::new(self.threshold, keys, self.sorted.unwrap_or(true))
     }
@@ -113,11 +116,98 @@ fn strip_comments(v: &mut Value) {
     }
 }
 
+/// JSON, but an object that names the same key twice is an error. Plain
+/// serde_json keeps the last one silently, so a spec could show one address
+/// to the eye and pay another. `_comment` keys may repeat.
+struct NoDup(Value);
+
+impl<'de> Deserialize<'de> for NoDup {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Value;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+            fn visit_bool<E>(self, b: bool) -> std::result::Result<Value, E> {
+                Ok(Value::Bool(b))
+            }
+            fn visit_i64<E>(self, n: i64) -> std::result::Result<Value, E> {
+                Ok(n.into())
+            }
+            fn visit_u64<E>(self, n: u64) -> std::result::Result<Value, E> {
+                Ok(n.into())
+            }
+            fn visit_f64<E>(self, n: f64) -> std::result::Result<Value, E> {
+                Ok(serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number))
+            }
+            fn visit_str<E>(self, s: &str) -> std::result::Result<Value, E> {
+                Ok(Value::String(s.to_owned()))
+            }
+            fn visit_unit<E>(self) -> std::result::Result<Value, E> {
+                Ok(Value::Null)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> std::result::Result<Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(NoDup(v)) = a.next_element()? {
+                    out.push(v);
+                }
+                Ok(Value::Array(out))
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> std::result::Result<Value, A::Error> {
+                let mut out = serde_json::Map::new();
+                while let Some(k) = a.next_key::<String>()? {
+                    let NoDup(v) = a.next_value()?;
+                    if out.insert(k.clone(), v).is_some() && !k.starts_with('_') {
+                        return Err(de::Error::custom(format!(
+                            "the key `{k}` appears twice in one object"
+                        )));
+                    }
+                }
+                Ok(Value::Object(out))
+            }
+        }
+        d.deserialize_any(V).map(NoDup)
+    }
+}
+
+/// Blank out everything a parser error quotes from the spec: serde repeats
+/// the offending string ("invalid type: string \"L1...\""), and a private key
+/// typed into the wrong field must not end up on screen or in a log.
+fn redact(msg: &str) -> String {
+    let mut out = String::new();
+    let mut chars = msg.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            out.push(c);
+            continue;
+        }
+        out.push_str("\"<hidden>\"");
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => break,
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 pub fn parse_spec(text: &str) -> Result<(Spec, Network)> {
-    let mut v: Value =
-        serde_json::from_str(text).map_err(|e| err!("spec is not valid JSON: {e}"))?;
+    let NoDup(mut v) = serde_json::from_str(text)
+        .map_err(|e| err!("spec is not valid JSON: {}", redact(&e.to_string())))?;
     strip_comments(&mut v);
-    let spec: Spec = serde_json::from_value(v).map_err(|e| err!("spec: {e}"))?;
+    let spec: Spec =
+        serde_json::from_value(v).map_err(|e| err!("spec: {}", redact(&e.to_string())))?;
     let net = parse_network(spec.network.as_deref().unwrap_or("mainnet"))?;
     Ok((spec, net))
 }
@@ -131,6 +221,42 @@ pub struct ResolvedInput {
     pub prev_tx: Option<Transaction>,
 }
 
+impl ResolvedInput {
+    /// Legacy inputs: the signature does not cover the amount.
+    pub fn is_legacy(&self) -> bool {
+        classify_input(
+            &self.txout.script_pubkey,
+            self.redeem_script.as_deref(),
+            self.witness_script.as_deref(),
+        )
+        .map(|k| k.is_legacy())
+        .unwrap_or(false)
+    }
+}
+
+/// `script_pubkey` and `address` may both be given, but only if they agree.
+fn script_or_address(
+    what: &str,
+    script_pubkey: &Option<String>,
+    address: &Option<String>,
+    net: Network,
+) -> Result<Option<ScriptBuf>> {
+    let from_hex = script_pubkey
+        .as_ref()
+        .map(|h| unhx(h).map(ScriptBuf::from))
+        .transpose()?;
+    let from_addr = address
+        .as_ref()
+        .map(|a| parse_address(a, net).map_err(|e| err!("{what}: {e}")))
+        .transpose()?;
+    if let (Some(a), Some(b)) = (&from_hex, &from_addr) {
+        if a != b {
+            bail!("{what}: script_pubkey and address disagree - give one, or make them match");
+        }
+    }
+    Ok(from_hex.or(from_addr))
+}
+
 fn resolve_input(n: usize, i: &InputSpec, net: Network) -> Result<ResolvedInput> {
     let txid: Txid = i
         .txid
@@ -140,11 +266,7 @@ fn resolve_input(n: usize, i: &InputSpec, net: Network) -> Result<ResolvedInput>
     let script = |h: &Option<String>| -> Result<Option<ScriptBuf>> {
         h.as_ref().map(|h| unhx(h).map(ScriptBuf::from)).transpose()
     };
-    let mut spk = match (&i.script_pubkey, &i.address) {
-        (Some(h), _) => Some(ScriptBuf::from(unhx(h)?)),
-        (None, Some(a)) => Some(parse_address(a, net).map_err(|e| err!("input {n}: {e}"))?),
-        (None, None) => None,
-    };
+    let mut spk = script_or_address(&format!("input {n}"), &i.script_pubkey, &i.address, net)?;
     let mut amount = i.amount_sat;
     let mut redeem_script = script(&i.redeem_script)?;
     let mut witness_script = script(&i.witness_script)?;
@@ -285,11 +407,17 @@ pub fn build(text: &str, force: bool) -> Result<Outcome> {
                 {
                     Ok(None)
                 }
-                Some(AmountSpec::Word(w)) => bail!("output {n}: bad amount_sat {w:?}"),
+                Some(AmountSpec::Word(w)) => {
+                    let _ = w; // never echoed: a misplaced key must not end up in an error
+                    bail!("output {n}: amount_sat must be a number of satoshis or \"all\"")
+                }
                 None => bail!("output {n}: amount_sat is required"),
             }
         };
         if let Some(text) = &o.op_return {
+            if o.address.is_some() || o.script_pubkey.is_some() {
+                bail!("output {n}: op_return cannot be combined with address or script_pubkey");
+            }
             let data = if o.hex {
                 unhx(text)?
             } else {
@@ -313,11 +441,9 @@ pub fn build(text: &str, force: bool) -> Result<Outcome> {
             });
             continue;
         }
-        let script_pubkey = match (&o.script_pubkey, &o.address) {
-            (Some(h), _) => ScriptBuf::from(unhx(h)?),
-            (None, Some(a)) => parse_address(a, net).map_err(|e| err!("output {n}: {e}"))?,
-            (None, None) => bail!("output {n}: needs address, script_pubkey or op_return"),
-        };
+        let script_pubkey =
+            script_or_address(&format!("output {n}"), &o.script_pubkey, &o.address, net)?
+                .ok_or_else(|| err!("output {n}: needs address, script_pubkey or op_return"))?;
         let value = match sats(&o.amount_sat)? {
             Some(v) => v,
             None => {
@@ -334,7 +460,7 @@ pub fn build(text: &str, force: bool) -> Result<Outcome> {
         });
     }
 
-    let total_in: u64 = resolved.iter().map(|r| r.txout.value.to_sat()).sum();
+    let total_in = sum_sats(resolved.iter().map(|r| r.txout.value.to_sat()))?;
     let mut tx = Transaction {
         version: Version(spec.version.unwrap_or(2)),
         lock_time: LockTime::from_consensus(spec.locktime.unwrap_or(0)),
@@ -362,15 +488,15 @@ pub fn build(text: &str, force: bool) -> Result<Outcome> {
         let vsize = estimate_vsize(&make_psbt(tx, &spec, &resolved)?, &all_keys)?;
         Ok((vsize as f64 * rate).ceil() as u64)
     };
-    let sum_out = |tx: &Transaction| tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
+    let sum_out = |tx: &Transaction| sum_sats(tx.output.iter().map(|o| o.value.to_sat()));
 
     if let Some(si) = sweep_index {
         let rate = spec
             .fee_rate
             .ok_or_else(|| err!("an 'all' output needs fee_rate (sat/vB)"))?;
-        let fixed = sum_out(&tx);
+        let fixed = sum_out(&tx)?;
         let fee = fee_for(&tx, rate)?;
-        if total_in <= fixed + fee {
+        if total_in <= fixed.saturating_add(fee) {
             bail!(
                 "inputs ({total_in} sat) cannot cover the outputs ({fixed} sat) + fee ({fee} sat)"
             );
@@ -382,14 +508,14 @@ pub fn build(text: &str, force: bool) -> Result<Outcome> {
             .fee_rate
             .ok_or_else(|| err!("change_address needs fee_rate (sat/vB)"))?;
         let script_pubkey = parse_address(change, net).map_err(|e| err!("change_address: {e}"))?;
-        let spent = sum_out(&tx);
+        let spent = sum_out(&tx)?;
         let dust = dust_threshold(&script_pubkey);
         tx.output.push(TxOut {
             value: Amount::ZERO,
             script_pubkey,
         });
         let fee = fee_for(&tx, rate)?;
-        if total_in < spent + fee {
+        if total_in < spent.saturating_add(fee) {
             bail!("inputs ({total_in} sat) cannot cover outputs ({spent} sat) + fee ({fee} sat)");
         }
         let change = total_in - spent - fee;
@@ -411,23 +537,27 @@ pub fn build(text: &str, force: bool) -> Result<Outcome> {
     }
 
     // ---- sanity ----------------------------------------------------------
-    let total_out = sum_out(&tx);
+    let total_out = sum_out(&tx)?;
     if total_out > total_in {
         bail!("outputs ({total_out} sat) exceed inputs ({total_in} sat)");
     }
     let fee = total_in - total_out;
-    if !force && fee > 100_000.max(total_in / 2) {
-        bail!(
-            "fee of {fee} sat looks like a mistake ({:.1}% of input). Use --force if you meant it.",
-            100.0 * fee as f64 / total_in as f64
-        );
-    }
+    check_shape(&tx)?;
 
     // ---- sign ------------------------------------------------------------
     let mut psbt = make_psbt(&tx, &spec, &resolved)?;
+    // Before any signature exists: refuse a fee that looks like a mistake.
+    check_fee(fee, total_in, estimate_vsize(&psbt, &all_keys)?, force)?;
+    // The spec is the user's own instruction, so its sighash choices and its
+    // amounts are honoured - `outcome` still warns about both.
+    let policy = Policy {
+        allow_sighash: true,
+        trust_amounts: true,
+        force_fee: force,
+    };
     for (n, keys) in own.iter().enumerate() {
         for sk in keys {
-            if !sign_input(&mut psbt, n, sk)? {
+            if !sign_input(&mut psbt, n, sk, &policy)? {
                 bail!("input {n}: the key given for this input does not unlock it");
             }
         }
@@ -435,11 +565,11 @@ pub fn build(text: &str, force: bool) -> Result<Outcome> {
     for (k, sk) in pool.iter().enumerate() {
         let mut used = false;
         for n in 0..psbt.inputs.len() {
-            used |= sign_input(&mut psbt, n, sk)?;
+            used |= sign_input(&mut psbt, n, sk, &policy)?;
         }
         if !used {
             bail!("spec key #{} does not unlock any input (wrong key?)", k + 1);
         }
     }
-    outcome(&psbt, net, notes)
+    outcome_for(&psbt, net, notes, force, true)
 }

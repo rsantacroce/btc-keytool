@@ -145,6 +145,7 @@ function renderOutcome(oc) {
       ["total in", sats(oc.total_in), { mono: false }],
       ["total out", sats(oc.total_out), { mono: false }],
       ["fee", `${oc.fee.toLocaleString("en-US")} sat  @ ${oc.fee_rate} sat/vB`, { mono: false }],
+      ["locktime", oc.locktime ? String(oc.locktime) : "", { mono: false }],
     ]),
     table("Outputs - where the money goes", oc.outputs.map((o) =>
       [`#${o.index} ${o.type}`, h("div", {}, h("span", { class: "mono" }, o.address || o.script_pubkey), `  ·  ${o.amount_sat.toLocaleString("en-US")} sat`)])),
@@ -186,6 +187,7 @@ function renderDecoded(d) {
   if (!d.psbt) return renderTx(d);
   return [
     banner(d.complete ? "ok" : "warn", d.complete ? "PSBT - fully signed" : "PSBT - needs more signatures"),
+    d.warnings.map((w) => banner("warn", "Warning", w)),
     table("Summary", [["total in", sats(d.total_in), { mono: false }], ["fee", `${d.fee.toLocaleString("en-US")} sat`, { mono: false }]]),
     table("Signatures", signatureRows(d.signatures)),
     renderTx(d.unsigned_tx, "Unsigned transaction"),
@@ -194,11 +196,21 @@ function renderDecoded(d) {
 
 function renderVerify(r) {
   const head = r.valid
-    ? banner("ok", "All signatures valid", "Checked by this tool and by Bitcoin Core's script interpreter.")
+    ? r.warnings.length
+      ? banner("warn", "Signatures valid - but read the warnings", "Valid signatures do not make this transaction safe.")
+      : banner("ok", "All signatures valid", "Checked by this tool and by Bitcoin Core's script interpreter.")
     : r.complete
       ? banner("bad", "INVALID", "At least one signature does not verify. Do not rely on this transaction.")
       : banner("warn", "Incomplete", "The signatures present are valid, but more are needed before this is a transaction.");
-  return [head, table("Signature check", [["txid", r.txid], ...checkRows(r.inputs, r.consensus, r.complete)])];
+  return [
+    head,
+    r.warnings.map((w) => banner("warn", "Warning", w)),
+    table("Signature check", [["txid", r.txid], ...checkRows(r.inputs, r.consensus, r.complete)]),
+    table("What it pays", [
+      ...r.outputs.map((o) => [`#${o.index} ${o.type}`, h("div", {}, h("span", { class: "mono" }, o.address || o.script_pubkey), `  ·  ${o.amount_sat.toLocaleString("en-US")} sat`)]),
+      ["fee", `${r.fee.toLocaleString("en-US")} sat  (inputs ${r.total_in.toLocaleString("en-US")} sat)`, { mono: false }],
+    ]),
+  ];
 }
 
 // ------------------------------------------------------------- examples ----
@@ -240,6 +252,18 @@ const EXAMPLES = {
 
 // -------------------------------------------------------------- actions ----
 
+// The PSBT text the user has been shown a review of. Signing anything else
+// shows the review first, so no signature is made on an unseen transaction.
+let reviewed = null;
+
+async function reviewPsbt(prompt) {
+  const text = $("sign-psbt").value;
+  const d = await call("decode", { data: text, network: net() });
+  reviewed = text;
+  show("sign-out", prompt && banner("warn", "Not signed yet - review it first",
+    "Check where the money goes and the fee below, then press Sign again."), renderDecoded(d));
+}
+
 const actions = {
   key: async () => show("key-out", renderKey(await call("key_info", { key: $("key-in").value, network: net() }))),
   newkey: async () => {
@@ -253,10 +277,10 @@ const actions = {
     sorted: $("ms-sorted").checked, network: net(),
   }))),
   build: async () => show("build-out", renderOutcome(await call("build", { spec: $("build-in").value, force: $("build-force").checked }))),
-  "sign-review": async () => show("sign-out", renderDecoded(await call("decode", { data: $("sign-psbt").value, network: net() }))),
-  sign: async () => show("sign-out", renderOutcome(await call("sign", { psbt: $("sign-psbt").value, keys: $("sign-keys").value, network: net() }))),
-  combine: async () => show("combine-out", renderOutcome(await call("combine", { psbts: lines($("combine-in").value), network: net() }))),
-  verify: async () => show("verify-out", renderVerify(await call("verify", { data: $("verify-in").value, spec: $("verify-spec").value }))),
+  "sign-review": () => reviewPsbt(false),
+  sign: async () => $("sign-psbt").value !== reviewed ? reviewPsbt(true) : show("sign-out", renderOutcome(await call("sign", { psbt: $("sign-psbt").value, keys: $("sign-keys").value, network: net(), trust: $("sign-trust").checked, force: $("sign-force").checked }))),
+  combine: async () => show("combine-out", renderOutcome(await call("combine", { psbts: lines($("combine-in").value), network: net(), force: $("combine-force").checked }))),
+  verify: async () => show("verify-out", renderVerify(await call("verify", { data: $("verify-in").value, spec: $("verify-spec").value, network: net() }))),
   decode: async () => show("decode-out", renderDecoded(await call("decode", { data: $("decode-in").value, network: net() }))),
   "msg-sign": async () => {
     const s = await call("msg_sign", { key: $("msg-key").value, message: $("msg-text").value, address: $("msg-addr").value, network: net() });

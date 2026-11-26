@@ -23,6 +23,9 @@ pub struct InputCheck {
     pub kind: String,
     pub ok: bool,
     pub note: String,
+    /// False when a signature uses a sighash type other than ALL, i.e. it
+    /// does not commit to the whole transaction.
+    pub sighash_all: bool,
 }
 
 /// Check every input's signature(s) against the outputs being spent.
@@ -40,20 +43,23 @@ pub fn verify_tx(tx: &Transaction, prevouts: &[TxOut]) -> Vec<InputCheck> {
                     kind: "?".into(),
                     ok: false,
                     note,
+                    sighash_all: true,
                 };
             }
             match check_input(tx, index, prevouts) {
-                Ok((kind, note)) => InputCheck {
+                Ok((kind, note, sighash_all)) => InputCheck {
                     index,
                     kind,
                     ok: true,
                     note,
+                    sighash_all,
                 },
                 Err(e) => InputCheck {
                     index,
                     kind: script_type(&prevouts[index].script_pubkey),
                     ok: false,
                     note: e.0,
+                    sighash_all: true,
                 },
             }
         })
@@ -94,7 +100,7 @@ fn check_ecdsa(
     Ok(hash_type)
 }
 
-fn check_input(tx: &Transaction, i: usize, prevouts: &[TxOut]) -> Result<(String, String)> {
+fn check_input(tx: &Transaction, i: usize, prevouts: &[TxOut]) -> Result<(String, String, bool)> {
     let utxo = &prevouts[i];
     let spk = &utxo.script_pubkey;
     let txin = &tx.input[i];
@@ -121,6 +127,7 @@ fn check_input(tx: &Transaction, i: usize, prevouts: &[TxOut]) -> Result<(String
         return Ok((
             "p2tr".into(),
             format!("schnorr key-path, sighash 0x{:02x}", sig.sighash_type as u8),
+            (sig.sighash_type as u8) <= 1,
         ));
     }
 
@@ -198,6 +205,7 @@ fn check_input(tx: &Transaction, i: usize, prevouts: &[TxOut]) -> Result<(String
             }
         }
         hash_types.dedup();
+        let all = hash_types.iter().all(|h| h == "0x01");
         return Ok((
             kind.name(),
             format!(
@@ -205,6 +213,7 @@ fn check_input(tx: &Transaction, i: usize, prevouts: &[TxOut]) -> Result<(String
                 signers.join(" "),
                 hash_types.join(" ")
             ),
+            all,
         ));
     }
 
@@ -226,7 +235,7 @@ fn check_input(tx: &Transaction, i: usize, prevouts: &[TxOut]) -> Result<(String
         bail!("the public key supplied does not match the output being spent");
     }
     let ht = check_ecdsa(tx, i, &kind, utxo, redeem, sig, &pk)?;
-    Ok((kind.name(), format!("ecdsa, sighash 0x{ht:02x}")))
+    Ok((kind.name(), format!("ecdsa, sighash 0x{ht:02x}"), ht == 1))
 }
 
 /// Run every input through Bitcoin Core's script interpreter with all

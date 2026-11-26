@@ -8,7 +8,7 @@ use btc_keytool_core::decode::{self, parse_psbt, VerifyReport};
 use btc_keytool_core::keys::{self, KeyInfo};
 use btc_keytool_core::message::{self, SignedMessage};
 use btc_keytool_core::selftest::Check;
-use btc_keytool_core::sign::{self, Outcome};
+use btc_keytool_core::sign::{self, Outcome, Policy};
 use btc_keytool_core::{parse_network, script, selftest, spec, Error};
 use serde_json::Value;
 
@@ -70,23 +70,30 @@ fn build(spec: String, force: bool) -> Reply<Outcome> {
 }
 
 #[tauri::command]
-fn sign(psbt: String, keys: String, network: String) -> Reply<Outcome> {
+fn sign(psbt: String, keys: String, network: String, trust: bool, force: bool) -> Reply<Outcome> {
     let mut p = parse_psbt(&psbt).map_err(s)?;
+    // The app never signs with a sighash type other than ALL.
+    let policy = Policy {
+        allow_sighash: false,
+        trust_amounts: trust,
+        force_fee: force,
+    };
     sign::sign_and_report(
         &mut p,
         &parse_keys(&keys)?,
         parse_network(&network).map_err(s)?,
+        &policy,
     )
     .map_err(s)
 }
 
 #[tauri::command]
-fn combine(psbts: Vec<String>, network: String) -> Reply<Outcome> {
+fn combine(psbts: Vec<String>, network: String, force: bool) -> Reply<Outcome> {
     let parsed = psbts
         .iter()
         .map(|p| parse_psbt(p).map_err(s))
         .collect::<Reply<Vec<_>>>()?;
-    sign::combine(parsed, parse_network(&network).map_err(s)?).map_err(s)
+    sign::combine(parsed, parse_network(&network).map_err(s)?, force).map_err(s)
 }
 
 #[tauri::command]
@@ -95,9 +102,9 @@ fn decode(data: String, network: String) -> Reply<Value> {
 }
 
 #[tauri::command]
-fn verify(data: String, spec: Option<String>) -> Reply<VerifyReport> {
+fn verify(data: String, spec: Option<String>, network: String) -> Reply<VerifyReport> {
     let spec = spec.filter(|t| !t.trim().is_empty());
-    decode::verify(&data, spec.as_deref()).map_err(s)
+    decode::verify(&data, spec.as_deref(), parse_network(&network).map_err(s)?).map_err(s)
 }
 
 #[tauri::command]

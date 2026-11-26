@@ -21,11 +21,12 @@ echo "key output: compared 15 key/network combinations"
 
 for t in bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH \
          3JvL6Ymt8MVWiCNHC7oWU6nLeHNJKLZGLN bc1pmfr3p9j00pfxjh0zmgp99y8zftmd3s5pmedqhyptwy6lm87hf5sspknck9 \
-         79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 \
          0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798; do
+  # a 32-byte x-only key is deliberately not compared: the Rust tool shows only its taproot
+  # address (the Python one guesses a parity and lists legacy/segwit addresses that may be wrong)
   diff <($PY addr $t --json) <($B addr $t --json) >/dev/null || { echo "DIFF addr $t"; fail=1; }
 done
-echo "addr output: compared 6 targets"
+echo "addr output: compared 5 targets"
 
 $PY key 0xabc --json > "$T/k.json"
 python3 - "$T" <<'PYEOF'

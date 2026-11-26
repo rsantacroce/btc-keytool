@@ -9,6 +9,7 @@
       "txid": "0000000000000000000000000000000000000000000000000000000000000000",
       "vout": 0,
       "amount_sat": 500000,
+      "_prev_tx": "Recommended: add \"prev_tx\": \"<raw hex of the transaction that funded this address>\". The PSBT then proves the amount, and the other cosigners can sign without --trust-amounts.",
       "address": "bc1q-the-multisig-address",
       "multisig": {
         "threshold": 2,

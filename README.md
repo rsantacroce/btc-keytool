@@ -40,6 +40,9 @@ They are not code-signed, so macOS and Windows warn on first launch.
 | `build.yml` | every PR, push to `main`, and `v*` tags | CLI for Linux x86_64/arm64, macOS arm64/x86_64, Windows x86_64; desktop app as `.deb`/AppImage, universal `.dmg`, Windows installer. On a tag the files go into a **draft** release |
 | `pages.yml` | pushes to `main` touching `site/` | publishes `site/` to <https://rsantacroce.github.io/btc-keytool/> |
 
+Actions are pinned to commit hashes, release builds do not use caches, and each release file
+gets a build-provenance attestation: `gh attestation verify <file> --repo rsantacroce/btc-keytool`.
+
 To cut a release: `git tag v0.2.0 && git push origin v0.2.0`, then review and publish the draft.
 
 ## Signing is always followed by verification
@@ -62,7 +65,10 @@ btc-keytool verify signed.hex spec.json     # raw tx: needs the spec (amounts + 
 btc-keytool verify partial.psbt             # PSBT: carries that itself
 ```
 
-`verify` exits 0 only for a fully signed transaction whose every signature is valid.
+`verify` exits 0 only for a fully signed transaction whose every signature is valid. Valid
+signatures do not mean it is the payment you intended, so `verify` also prints what the
+transaction pays and its fee, and warns about signatures that do not commit to the whole
+transaction and about input amounts nothing proves.
 
 ## Keys
 
@@ -72,7 +78,7 @@ btc-keytool key KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn
 btc-keytool key --file key.txt          # keeps it out of your shell history and `ps`
 btc-keytool newkey
 btc-keytool addr bc1q…                  # address -> scriptPubKey, type, dust limit
-btc-keytool addr 02abc…                 # public key -> all its addresses
+btc-keytool addr 02abc…                 # public key -> all its addresses (a 32-byte x-only key: taproot only)
 ```
 
 Accepts WIF, 64-character hex, `0x…` hex or a decimal integer. Add `--json` to any command
@@ -149,6 +155,32 @@ Outputs: any address type, a raw `script_pubkey`, or `op_return`.
 }
 ```
 
+## Signing a PSBT someone else made
+
+A PSBT can come from a cosigner whose machine is compromised, or from someone who wants your
+signature for a different purpose than they claim. `sign` therefore treats it as untrusted:
+
+| What the PSBT tries | What `sign` does |
+|---|---|
+| Asks for a sighash type other than `ALL` (`NONE`, `SINGLE`, `ANYONECANPAY`), so the outputs can be rewritten after you sign | Refuses. `--allow-sighash` overrides, and the result is flagged in every later `decode`/`verify` |
+| `SIGHASH_SINGLE` on an input with no matching output, which yields a signature valid for *any* spend of that key | Refuses always; no override |
+| Claims an amount for a legacy input (P2PKH, P2PK, P2SH multisig) without including the previous transaction. Legacy signatures do not cover the amount, so an understated amount silently becomes fee | Refuses. `--trust-amounts` overrides. Give `prev_tx` in the spec and the proof travels inside the PSBT |
+| Claims an amount for a segwit v0 input (P2WPKH, P2WSH and their P2SH-nested forms) without including the previous transaction. Such a signature covers only its own input's amount, so two signed versions of one transaction, each lying about a different input, can be spliced into one that burns the difference as fee | Refuses. `--trust-amounts` overrides. `prev_tx` in the spec avoids it. Taproot inputs are exempt: their signatures commit to every amount |
+| A fee above 100k sat that is over half the inputs or over 1000 sat/vB | Refuses, before any signature is made. `--force` overrides |
+| Amounts that overflow, no inputs, the same input twice | Refuses |
+
+At a terminal, `sign` first shows what the transaction pays and its fee and asks for
+confirmation (`--yes` skips it). With nobody at the terminal (piped input or output, `--json`)
+it refuses unless `--yes` is given: review with `decode` first. The desktop app shows the same
+review on the first press of Sign and signs on the second, and never signs a non-`ALL` sighash.
+
+`build` works from your own spec, so it honours a `sighash` you set and an `amount_sat` you
+typed, but it warns about both; `SIGHASH_SINGLE` without a matching output is refused there too.
+
+Not covered: for segwit-v0 inputs the signature binds only that input's own amount. Someone who
+gets you to sign the *same* inputs twice with different claimed amounts can still inflate the
+fee, so treat a request to re-sign as suspicious. Taproot inputs are not affected.
+
 ## Multisig
 
 **1. Create the address** from the cosigners' *public* keys:
@@ -164,7 +196,9 @@ Keys are BIP67-sorted by default, so everyone gets the same address whatever ord
 type the keys in. **Each cosigner should run this themselves and compare the address.**
 
 **2. Build the spend.** Put a `multisig` block on the input (see `examples/multisig.json`)
-and list whatever private keys you hold - possibly none:
+and list whatever private keys you hold - possibly none. Add `prev_tx` (the raw hex of the
+transaction that funded the multisig) to the input, so the PSBT proves the amount it spends;
+without it every other cosigner has to pass `--trust-amounts`:
 
 ```bash
 btc-keytool build spend.json -o spend.psbt
@@ -229,7 +263,7 @@ machine that is not connected.
 ## Verifying the tool itself
 
 ```bash
-btc-keytool selftest        # 99 checks, also available in the app
+btc-keytool selftest        # 124 checks, also available in the app
 btc-keytool selftest -v
 cargo test --workspace      # the same checks, plus cross-checks against rust-miniscript
 legacy/parity.sh            # compares against the original Python implementation
@@ -239,7 +273,8 @@ The self-test runs the official BIP143 sighash/signature vector, BIP173/BIP350 a
 vectors, the BIP86 taproot vector, a BIP67 multisig vector and the genesis coinbase, then
 build -> sign -> verify round-trips for every input type and every multisig wrapping, and
 negative tests: wrong key, non-cosigner key, forged cosigner signature, overspend, absurd fee,
-misspelled field, tampered amount.
+misspelled field, tampered amount, weak sighash requests, the SIGHASH_SINGLE replay bug,
+unproven legacy amounts, overflowing amounts.
 
 Cryptography is not implemented here: keys, ECDSA (RFC 6979, low-S) and Schnorr (BIP340)
 come from libsecp256k1 via `rust-bitcoin`. Signing is deterministic, so the same spec always
@@ -248,6 +283,13 @@ yields the same bytes - and, for single-key transactions, the same bytes the Pyt
 ## Safety
 
 - The tool never asks for and never stores a seed phrase; it works on individual keys.
+- Keep keys off the command line: `--key-file key.txt`, or `--key-file -` to read from standard
+  input. A key given as an argument is visible in `ps` and saved in shell history.
+- Private keys are not wiped from memory after use, and "Copy" in the app puts them on the
+  system clipboard, which other programs (and clipboard sync between devices) can read.
+- Signing is deterministic (RFC 6979 for ECDSA, BIP340 without auxiliary randomness for
+  Schnorr): no random number generator is involved, so a weak one cannot leak a key. The
+  trade-off is no extra hardening against an attacker who can physically measure the machine.
 - Nothing is written to disk unless you pass `-o`.
 - A signed transaction is **bearer-spendable**: anyone holding the hex can broadcast it.
 - A PSBT contains no private keys, but it does reveal the addresses and amounts involved.

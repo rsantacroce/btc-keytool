@@ -50,6 +50,16 @@ pub fn parse_key(text: &str) -> Result<SecretKey> {
     }
 }
 
+/// Text to quote back in an error message - unless it would be accepted as a
+/// private key, which must never be repeated on screen or into a log.
+pub fn echo(text: &str) -> String {
+    if parse_key(text).is_ok() {
+        "<hidden: this looks like a private key>".into()
+    } else {
+        format!("{text:?}")
+    }
+}
+
 /// A fresh key straight from the operating system's entropy source.
 pub fn generate_key() -> SecretKey {
     SecretKey::new(&mut OsRng)
@@ -66,6 +76,20 @@ pub fn parse_pubkey(hex: &str) -> Result<PublicKey> {
         33 | 65 => PublicKey::from_slice(&b).map_err(|e| err!("pubkey: {e}")),
         n => bail!("pubkey: unrecognised length {n}"),
     }
+}
+
+/// A 33-byte compressed public key and nothing else. Multisig scripts need
+/// the exact key: guessing the parity of an x-only key would build an
+/// address nobody can sign for.
+pub fn parse_compressed_pubkey(hex: &str) -> Result<PublicKey> {
+    let b = unhx(hex)?;
+    if b.len() != 33 {
+        bail!(
+            "public key must be compressed (33 bytes, starting 02 or 03), got {} bytes",
+            b.len()
+        );
+    }
+    PublicKey::from_slice(&b).map_err(|e| err!("pubkey: {e}"))
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -148,7 +172,24 @@ pub fn key_info(sk: &SecretKey, net: Network) -> Result<KeyInfo> {
 /// (-> every address it controls).
 pub fn inspect(target: &str, net: Network) -> Result<Value> {
     let t = target.trim();
-    if matches!(t.len(), 64 | 66 | 130) && t.chars().all(|c| c.is_ascii_hexdigit()) {
+    let is_hex = t.chars().all(|c| c.is_ascii_hexdigit());
+    if t.len() == 64 && is_hex {
+        // 32 bytes can only be a taproot (x-only) key. It does not say which
+        // of the two points with this x is meant, so legacy and segwit v0
+        // addresses cannot be derived from it - and it may just as well be a
+        // private key pasted into the wrong place.
+        let x = XOnlyPublicKey::from_slice(&unhx(t)?)
+            .map_err(|_| err!("x-only pubkey: x is not on the curve"))?;
+        return Ok(json!({
+            "x_only_public_key": hx(&x.serialize()),
+            "p2tr": Address::p2tr(secp(), x, None, net).to_string(),
+            "note": "Read as a 32-byte taproot (x-only) PUBLIC key, used as the internal key. \
+                     Such a key has no legacy or segwit v0 address: give the 33-byte compressed \
+                     key for those. If this is a PRIVATE key, do not fund this address - use \
+                     `key` instead.",
+        }));
+    }
+    if matches!(t.len(), 66 | 130) && is_hex {
         let pk = parse_pubkey(t)?;
         let a = addresses_for_pubkey(&pk.inner, net);
         return Ok(json!({

@@ -92,8 +92,8 @@
     </section>
 
     <section id="sign">
-      <p class="hint">Add your signature to a partially signed transaction. Review the outputs and the fee below before
-        passing it on: you are authorising exactly that payment.</p>
+      <p class="hint">Add your signature to a partially signed transaction. The first press of Sign shows what it pays;
+        check the outputs and the fee, then press Sign again: you are authorising exactly that payment.</p>
       <label>PSBT <small>base64 or hex</small>
         <textarea id="sign-psbt" class="mono" rows="6" spellcheck="false"></textarea>
       </label>
@@ -105,6 +105,10 @@
         <button class="go" data-act="sign">Sign</button>
         <label class="check"><input type="checkbox" data-reveal="sign"> show keys</label>
       </div>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="sign-trust"> sign inputs whose amount the PSBT does not prove (no previous transaction)</label>
+        <label class="check"><input type="checkbox" id="sign-force"> allow an unusually large fee</label>
+      </div>
       <div class="out" id="sign-out"></div>
     </section>
 
@@ -113,12 +117,15 @@
       <label>PSBTs <small>one per line</small>
         <textarea id="combine-in" class="mono" rows="8" spellcheck="false"></textarea>
       </label>
-      <div class="row"><button class="go" data-act="combine">Combine</button></div>
+      <div class="row">
+        <button class="go" data-act="combine">Combine</button>
+        <label class="check"><input type="checkbox" id="combine-force"> allow an unusually large fee</label>
+      </div>
       <div class="out" id="combine-out"></div>
     </section>
 
     <section id="verify">
-      <p class="hint">Verify every signature of a signed transaction or a PSBT. A raw transaction needs the spec it was
+      <p class="hint">Verify every signature of a signed transaction or a PSBT. Valid signatures do not mean the payment is the one you intended: check the outputs and fee shown. A raw transaction needs the spec it was
         built from, because signatures commit to the amounts being spent and the transaction does not contain them.</p>
       <label>Raw transaction hex or PSBT
         <textarea id="verify-in" class="mono" rows="6" spellcheck="false"></textarea>
