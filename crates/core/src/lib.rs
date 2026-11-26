@@ -65,7 +65,8 @@ pub fn parse_network(s: &str) -> Result<Network> {
         "signet" => Network::Signet,
         "regtest" => Network::Regtest,
         other => bail!(
-            "unknown network {other:?} (expected one of {})",
+            "unknown network {} (expected one of {})",
+            keys::echo(other),
             NETWORKS.join(", ")
         ),
     })
@@ -87,4 +88,23 @@ pub fn hx(b: &[u8]) -> String {
 pub fn unhx(s: &str) -> Result<Vec<u8>> {
     let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     Vec::<u8>::from_hex(&cleaned).map_err(|e| err!("bad hex: {e}"))
+}
+
+/// No amount can exceed the total supply.
+pub const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+
+/// Add up satoshi amounts, refusing anything impossible. Amounts in a PSBT
+/// or a spec are attacker-controlled; a wrapped sum would misreport the fee.
+pub fn sum_sats(values: impl IntoIterator<Item = u64>) -> Result<u64> {
+    let mut total = 0u64;
+    for v in values {
+        if v > MAX_MONEY {
+            bail!("amount of {v} sat is more than all the bitcoin that can exist");
+        }
+        total = total
+            .checked_add(v)
+            .filter(|t| *t <= MAX_MONEY)
+            .ok_or_else(|| err!("amounts add up to more than all the bitcoin that can exist"))?;
+    }
+    Ok(total)
 }

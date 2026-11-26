@@ -51,7 +51,7 @@ pub fn parse_address(addr: &str, net: Network) -> Result<ScriptBuf> {
     let a: Address<bitcoin::address::NetworkUnchecked> = addr
         .trim()
         .parse()
-        .map_err(|e| err!("address {addr:?}: {e}"))?;
+        .map_err(|e| err!("address {}: {e}", crate::keys::echo(addr)))?;
     if !a.is_valid_for_network(net) {
         bail!("address {addr} does not belong to {}", network_name(net));
     }
@@ -89,7 +89,10 @@ impl Wrap {
             "p2wsh" => Wrap::P2wsh,
             "p2sh-p2wsh" => Wrap::P2shP2wsh,
             "p2sh" => Wrap::P2sh,
-            other => bail!("unknown multisig type {other:?} (p2wsh, p2sh-p2wsh or p2sh)"),
+            _ => bail!(
+                "unknown multisig type {} (p2wsh, p2sh-p2wsh or p2sh)",
+                crate::keys::echo(s)
+            ),
         })
     }
 
@@ -271,7 +274,7 @@ pub fn multisig_info(
     let wrap = Wrap::parse(kind)?;
     let keys = pubkeys
         .iter()
-        .map(|p| crate::keys::parse_pubkey(p))
+        .map(|p| crate::keys::parse_compressed_pubkey(p))
         .collect::<Result<Vec<_>>>()?;
     let ms = Multisig::new(threshold, keys, sorted)?;
     let spk = ms.script_pubkey(wrap)?;
@@ -379,6 +382,20 @@ impl Kind {
                 )
             }
         }
+    }
+
+    /// Pre-segwit spends: the signature does NOT commit to the amount being
+    /// spent, so a wrong amount goes unnoticed and silently becomes fee.
+    pub fn is_legacy(&self) -> bool {
+        matches!(
+            self,
+            Kind::P2pk(_)
+                | Kind::P2pkh
+                | Kind::Multi {
+                    wrap: Wrap::P2sh,
+                    ..
+                }
+        )
     }
 
     /// Signatures required to spend.

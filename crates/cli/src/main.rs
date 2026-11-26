@@ -13,7 +13,7 @@ use btc_keytool_core::decode::{decode, parse_psbt, verify};
 use btc_keytool_core::keys::{generate_key, inspect, key_info, parse_key};
 use btc_keytool_core::message::{sign_message, verify_message};
 use btc_keytool_core::script::multisig_info;
-use btc_keytool_core::sign::{combine, sign_and_report, Outcome};
+use btc_keytool_core::sign::{combine, outcome, sign_and_report, Outcome, Policy};
 use btc_keytool_core::{parse_network, selftest, spec, Error, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -81,11 +81,27 @@ enum Cmd {
         /// Private key (repeatable). Prefer --key-file.
         #[arg(long = "key")]
         keys: Vec<String>,
-        /// File holding a private key (repeatable)
+        /// File holding a private key (repeatable); "-" reads it from standard input
         #[arg(long = "key-file")]
         key_files: Vec<PathBuf>,
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Sign without asking for confirmation. Required when nobody is at the
+        /// terminal (piped input or output, --json): review with `decode` first
+        #[arg(short, long)]
+        yes: bool,
+        /// Sign even if asked to use a sighash type other than ALL. Dangerous:
+        /// the transaction can then be changed after you sign
+        #[arg(long)]
+        allow_sighash: bool,
+        /// Sign legacy and segwit v0 inputs although the PSBT does not carry the
+        /// previous transactions that prove their amounts. A wrong amount can
+        /// end up as fee
+        #[arg(long)]
+        trust_amounts: bool,
+        /// Allow an unusually large fee
+        #[arg(long)]
+        force: bool,
     },
     /// Merge PSBTs of one transaction that cosigners signed separately
     Combine {
@@ -94,6 +110,9 @@ enum Cmd {
         psbts: Vec<String>,
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Allow an unusually large fee
+        #[arg(long)]
+        force: bool,
     },
     /// Decode a raw transaction or a PSBT (string or file)
     Decode { data: String },
@@ -192,8 +211,46 @@ fn btc(sat: u64) -> String {
 
 // -------------------------------------------------------------- input ----
 
+/// Read a file; "-" means standard input, which keeps a key off the command
+/// line and off the disk.
 fn read_file(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+            .map_err(|e| Error(format!("standard input: {e}")))?;
+        return Ok(text);
+    }
     std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))
+}
+
+/// Show what is about to be signed and ask. Needs a person at the terminal;
+/// anything else has to say --yes.
+fn confirm_signing(oc: &Outcome) -> Result<bool> {
+    head("ABOUT TO SIGN", "review before your signature is added");
+    row("total in", btc(oc.total_in));
+    row("fee", format!("{} sat  @ ~{} sat/vB", oc.fee, oc.fee_rate));
+    if oc.locktime != 0 {
+        row("locktime", oc.locktime);
+    }
+    for o in &oc.outputs {
+        row(
+            &format!("pays #{}", o.index),
+            format!(
+                "{}  {} sat",
+                o.address.as_deref().unwrap_or(&o.script_pubkey),
+                o.amount_sat
+            ),
+        );
+    }
+    for n in oc.notes.iter().filter(|n| n.starts_with("WARNING")) {
+        println!("{}", c(&format!("  {n}"), YELLOW));
+    }
+    eprint!("\n  Sign this transaction? [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| Error(e.to_string()))?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
 /// An argument that is either the data itself or the name of a file holding it.
@@ -281,6 +338,9 @@ fn show_outcome(oc: &Outcome, out: Option<&Path>, json: bool) -> Result<()> {
     row("total in", btc(oc.total_in));
     row("total out", btc(oc.total_out));
     row("fee", format!("{} sat  @ {} sat/vB", oc.fee, oc.fee_rate));
+    if oc.locktime != 0 {
+        row("locktime", oc.locktime);
+    }
     head("OUTPUTS", "");
     for o in &oc.outputs {
         row(
@@ -462,17 +522,44 @@ fn run(cli: Cli) -> Result<ExitCode> {
             keys,
             key_files,
             out,
+            yes,
+            allow_sighash,
+            trust_amounts,
+            force,
         } => {
             let mut p = parse_psbt(&data_arg(&psbt)?)?;
             let keys = load_keys(&keys, &key_files)?;
-            show_outcome(&sign_and_report(&mut p, &keys, net)?, out.as_deref(), json)?;
+            let policy = Policy {
+                allow_sighash,
+                trust_amounts,
+                force_fee: force,
+            };
+            let interactive =
+                std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !json;
+            if !yes {
+                if !interactive {
+                    return Err(Error(
+                        "not signed: nobody is at the terminal to confirm what this pays. \
+                         Review it with `decode`, then pass --yes"
+                            .into(),
+                    ));
+                }
+                if !confirm_signing(&outcome(&p, net, vec![], true)?)? {
+                    return Err(Error("not signed".into()));
+                }
+            }
+            show_outcome(
+                &sign_and_report(&mut p, &keys, net, &policy)?,
+                out.as_deref(),
+                json,
+            )?;
         }
-        Cmd::Combine { psbts, out } => {
+        Cmd::Combine { psbts, out, force } => {
             let parsed = psbts
                 .iter()
                 .map(|p| parse_psbt(&data_arg(p)?))
                 .collect::<Result<Vec<_>>>()?;
-            show_outcome(&combine(parsed, net)?, out.as_deref(), json)?;
+            show_outcome(&combine(parsed, net, force)?, out.as_deref(), json)?;
         }
         Cmd::Decode { data } => {
             let d = decode(&data_arg(&data)?, net)?;
@@ -493,6 +580,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 );
                 row("total in", btc(d["total_in"].as_u64().unwrap_or(0)));
                 row("fee", format!("{} sat", d["fee"]));
+                for w in d["warnings"].as_array().into_iter().flatten() {
+                    println!(
+                        "{}",
+                        c(&format!("  WARNING {}", w.as_str().unwrap_or("")), YELLOW)
+                    );
+                }
                 for s in d["signatures"].as_array().into_iter().flatten() {
                     row(
                         &format!("input {}", s["index"]),
@@ -513,7 +606,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Verify { data, spec } => {
             let spec_text = spec.as_deref().map(read_file).transpose()?;
-            let r = verify(&data_arg(&data)?, spec_text.as_deref())?;
+            let r = verify(&data_arg(&data)?, spec_text.as_deref(), net)?;
             if json {
                 print_json(&r)?;
             } else {
@@ -537,7 +630,23 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         }
                     );
                 }
+                println!();
+                for o in &r.outputs {
+                    println!(
+                        "  pays #{}  {}  {} sat",
+                        o.index,
+                        o.address.as_deref().unwrap_or(&o.script_pubkey),
+                        o.amount_sat
+                    );
+                }
+                println!("  fee      {} sat  (inputs {} sat)", r.fee, r.total_in);
+                for w in &r.warnings {
+                    println!("{}", c(&format!("  WARNING {w}"), YELLOW));
+                }
                 let verdict = match (r.valid, r.complete) {
+                    (true, _) if !r.warnings.is_empty() => {
+                        c("signatures valid - but read the warnings above", YELLOW)
+                    }
                     (true, _) => c("all signatures valid", GREEN),
                     (false, false) => c(
                         "INCOMPLETE - signatures present are valid, but more are needed",

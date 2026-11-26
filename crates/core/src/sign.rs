@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use crate::script::{classify_input, dust_threshold, script_address, script_type, Kind, Wrap};
 use crate::verify::{consensus_verify, verify_tx, InputCheck};
-use crate::{hx, network_name, secp, Result};
+use crate::{hx, network_name, secp, sum_sats, Result};
 
 /// The output an input spends, from the PSBT's UTXO fields.
 pub fn utxo(psbt: &Psbt, i: usize) -> Result<TxOut> {
@@ -113,9 +113,48 @@ fn both_pubkeys(sk: &SecretKey) -> [PublicKey; 2] {
     [PublicKey::new(pk), PublicKey::new_uncompressed(pk)]
 }
 
+/// What the person at the keyboard has explicitly agreed to. Everything is
+/// off by default: a PSBT may come from someone who wants to trick the signer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Policy {
+    /// Sign with a sighash type other than ALL (which lets someone else
+    /// change the transaction afterwards).
+    pub allow_sighash: bool,
+    /// Sign legacy and segwit v0 inputs whose amount is not proven by the
+    /// previous transaction. (Taproot signatures commit to every amount.)
+    pub trust_amounts: bool,
+    /// Accept a fee that looks like a mistake.
+    pub force_fee: bool,
+}
+
+fn sighash_is_all(raw: u32, taproot: bool) -> bool {
+    raw == 1 || (taproot && raw == 0)
+}
+
+/// Refuse sighash types that let the transaction be altered after signing.
+fn check_sighash(psbt: &Psbt, i: usize, raw: u32, taproot: bool, policy: &Policy) -> Result<()> {
+    // SIGHASH_SINGLE with no matching output signs a constant instead of the
+    // transaction: for legacy inputs that signature is valid for ANY spend
+    // of the same key, forever. Never sign it, whatever the policy.
+    if raw & 0x1f == 3 && i >= psbt.unsigned_tx.output.len() {
+        bail!(
+            "input {i}: refusing SIGHASH_SINGLE with no output {i} - that signature would not \
+             commit to this transaction at all and could be replayed to spend other coins"
+        );
+    }
+    if !sighash_is_all(raw, taproot) && !policy.allow_sighash {
+        bail!(
+            "input {i}: this transaction asks you to sign with sighash 0x{raw:02x}, which does \
+             not commit to the whole transaction: someone could change where the money goes \
+             after you sign. Refusing (override: --allow-sighash)"
+        );
+    }
+    Ok(())
+}
+
 /// Sign input `i` with `sk` if that key can unlock it. Returns whether this
 /// key now has a signature on the input.
-pub fn sign_input(psbt: &mut Psbt, i: usize, sk: &SecretKey) -> Result<bool> {
+pub fn sign_input(psbt: &mut Psbt, i: usize, sk: &SecretKey, policy: &Policy) -> Result<bool> {
     let secp = secp();
     if psbt.inputs[i].final_script_sig.is_some() || psbt.inputs[i].final_script_witness.is_some() {
         return Ok(false);
@@ -144,6 +183,7 @@ pub fn sign_input(psbt: &mut Psbt, i: usize, sk: &SecretKey) -> Result<bool> {
             Some(t) => t.taproot_hash_ty().map_err(|e| err!("input {i}: {e}"))?,
             None => TapSighashType::Default,
         };
+        check_sighash(psbt, i, ty as u32, true, policy)?;
         let prevouts = utxos(psbt)?;
         let digest = SighashCache::new(&psbt.unsigned_tx).taproot_key_spend_signature_hash(
             i,
@@ -174,6 +214,33 @@ pub fn sign_input(psbt: &mut Psbt, i: usize, sk: &SecretKey) -> Result<bool> {
         Some(t) => t.ecdsa_hash_ty().map_err(|e| err!("input {i}: {e}"))?,
         None => EcdsaSighashType::All,
     };
+    check_sighash(psbt, i, ty.to_u32(), false, policy)?;
+    let unproven = psbt.inputs[i].non_witness_utxo.is_none() && !policy.trust_amounts;
+    if unproven && !kind.is_legacy() {
+        // A segwit v0 signature commits to the amount of its own input only.
+        // Whoever gets two versions of one transaction signed, each lying
+        // about a different input, can splice the signatures together and
+        // turn the difference into fee.
+        bail!(
+            "input {i} is a segwit v0 ({}) output: its signature covers only this input's own \
+             amount, and this PSBT does not include the previous transaction to prove the {} sat \
+             it claims. Signing two versions of a transaction with different claimed amounts \
+             lets someone combine the signatures and take the difference as fee. Ask for a PSBT \
+             that carries the previous transaction (override: --trust-amounts)",
+            kind.name(),
+            out.value.to_sat()
+        );
+    }
+    if unproven {
+        bail!(
+            "input {i} is a legacy ({}) output: its signature does not cover the amount, and \
+             this PSBT does not include the previous transaction to prove the {} sat it claims. \
+             If the real amount is larger, the difference is lost as fee. Ask for a PSBT that \
+             carries the previous transaction (override: --trust-amounts)",
+            kind.name(),
+            out.value.to_sat()
+        );
+    }
     let msg = ecdsa_sighash(
         &psbt.unsigned_tx,
         i,
@@ -196,11 +263,11 @@ pub fn sign_input(psbt: &mut Psbt, i: usize, sk: &SecretKey) -> Result<bool> {
 }
 
 /// Sign every input each key can. Returns, per key, how many inputs it signed.
-pub fn sign_psbt(psbt: &mut Psbt, keys: &[SecretKey]) -> Result<Vec<usize>> {
+pub fn sign_psbt(psbt: &mut Psbt, keys: &[SecretKey], policy: &Policy) -> Result<Vec<usize>> {
     let mut counts = vec![0; keys.len()];
     for i in 0..psbt.inputs.len() {
         for (n, sk) in keys.iter().enumerate() {
-            if sign_input(psbt, i, sk)? {
+            if sign_input(psbt, i, sk, policy)? {
                 counts[n] += 1;
             }
         }
@@ -278,9 +345,21 @@ pub struct SigStatus {
     pub signed_by: Vec<String>,
     /// Multisig keys that have not signed yet.
     pub missing: Vec<String>,
+    /// True when the amount is proven by the previous transaction, or the
+    /// input is taproot (whose signature commits to every input's amount).
+    pub amount_verified: bool,
+    /// Things a signer must not overlook about this input.
+    pub warnings: Vec<String>,
 }
 
 pub fn status(psbt: &Psbt) -> Result<Vec<SigStatus>> {
+    status_for(psbt, false)
+}
+
+/// `own_spec`: the PSBT was just built from the user's own spec, so a segwit
+/// amount they typed themselves is not worth a warning (a wrong one only
+/// makes the signature invalid). Legacy amounts are warned about regardless.
+fn status_for(psbt: &Psbt, own_spec: bool) -> Result<Vec<SigStatus>> {
     let mut all = Vec::new();
     for i in 0..psbt.inputs.len() {
         let out = utxo(psbt, i)?;
@@ -296,7 +375,22 @@ pub fn status(psbt: &Psbt) -> Result<Vec<SigStatus>> {
             need: 1,
             signed_by: vec![],
             missing: vec![],
+            amount_verified: inp.non_witness_utxo.is_some(),
+            warnings: vec![],
         };
+        let weak = |raw: u32, taproot: bool, who: &str| {
+            (!sighash_is_all(raw, taproot)).then(|| {
+                format!(
+                    "input {i}: {who} sighash 0x{raw:02x}, which does not commit to the whole \
+                     transaction - it can be altered after signing"
+                )
+            })
+        };
+        if let Some(t) = inp.sighash_type {
+            let taproot = out.script_pubkey.is_p2tr();
+            st.warnings
+                .extend(weak(t.to_u32(), taproot, "this PSBT asks signers to use"));
+        }
         if inp.final_script_sig.is_some() || inp.final_script_witness.is_some() {
             st.have = 1;
             st.kind += " (finalized)";
@@ -304,10 +398,37 @@ pub fn status(psbt: &Psbt) -> Result<Vec<SigStatus>> {
             let kind = kind_of(psbt, i)?;
             st.kind = kind.name();
             st.need = kind.need();
+            st.amount_verified |= kind == Kind::P2tr;
+            if !st.amount_verified && !kind.is_legacy() && !own_spec {
+                st.warnings.push(format!(
+                    "input {i}: the amount ({} sat) is taken on trust - the previous transaction \
+                     was not supplied, and a segwit v0 signature covers only its own input's \
+                     amount. Never sign a second version of this transaction",
+                    out.value.to_sat()
+                ));
+            }
+            if kind.is_legacy() && inp.non_witness_utxo.is_none() {
+                st.warnings.push(format!(
+                    "input {i}: the amount ({} sat) is NOT verified - legacy signatures do not \
+                     cover it and the previous transaction was not supplied. If the real amount \
+                     is larger, the difference is lost as fee",
+                    out.value.to_sat()
+                ));
+            }
             if kind == Kind::P2tr {
-                st.have = valid_tap_sig(psbt, i, &out)?.is_some() as usize;
+                let sig = valid_tap_sig(psbt, i, &out)?;
+                st.have = sig.is_some() as usize;
+                if let Some(sig) = sig {
+                    st.warnings
+                        .extend(weak(sig.sighash_type as u32, true, "it is signed with"));
+                }
             } else if kind != Kind::P2shUnknown {
                 let sigs = valid_sigs(psbt, i, &kind, &out)?;
+                for (pk, sig) in &sigs {
+                    let who = format!("key {pk} signed with");
+                    st.warnings
+                        .extend(weak(sig.sighash_type.to_u32(), false, &who));
+                }
                 st.have = sigs.len();
                 st.signed_by = sigs.iter().map(|(pk, _)| pk.to_string()).collect();
                 if let Kind::Multi { ms, .. } = &kind {
@@ -495,6 +616,7 @@ pub struct Outcome {
     pub fee: u64,
     pub fee_rate: f64,
     pub outputs: Vec<OutputInfo>,
+    pub locktime: u32,
     pub signatures: Vec<SigStatus>,
     /// Per-input signature verification of the finished transaction.
     pub verify: Vec<InputCheck>,
@@ -504,26 +626,48 @@ pub struct Outcome {
     pub notes: Vec<String>,
 }
 
-/// Summarise a PSBT; if every signature is present, finalise it and verify
-/// the result. A transaction that fails verification is never returned.
-pub fn outcome(psbt: &Psbt, net: Network, mut notes: Vec<String>) -> Result<Outcome> {
-    let signatures = status(psbt)?;
-    let prevouts = utxos(psbt)?;
-    let complete = signatures.iter().all(|s| s.have >= s.need);
-    let total_in: u64 = prevouts.iter().map(|o| o.value.to_sat()).sum();
-    let total_out: u64 = psbt
-        .unsigned_tx
-        .output
-        .iter()
-        .map(|o| o.value.to_sat())
-        .sum();
+/// A transaction must spend something, and nothing twice.
+pub fn check_shape(tx: &Transaction) -> Result<()> {
+    if tx.input.is_empty() {
+        bail!("the transaction has no inputs");
+    }
+    for (i, a) in tx.input.iter().enumerate() {
+        if tx.input[..i]
+            .iter()
+            .any(|b| b.previous_output == a.previous_output)
+        {
+            bail!("input {i} spends {} a second time", a.previous_output);
+        }
+    }
+    Ok(())
+}
+
+/// Inputs minus outputs, with overflow and overspend treated as errors.
+pub fn fee_of(tx: &Transaction, prevouts: &[TxOut]) -> Result<(u64, u64, u64)> {
+    let total_in = sum_sats(prevouts.iter().map(|o| o.value.to_sat()))?;
+    let total_out = sum_sats(tx.output.iter().map(|o| o.value.to_sat()))?;
     if total_out > total_in {
         bail!("outputs ({total_out} sat) exceed inputs ({total_in} sat)");
     }
-    let fee = total_in - total_out;
-    let outputs = psbt
-        .unsigned_tx
-        .output
+    Ok((total_in, total_out, total_in - total_out))
+}
+
+/// Stop a fee that is almost certainly a mistake (or an attack): above
+/// 100k sat and either more than half the inputs or over 1000 sat/vB.
+pub fn check_fee(fee: u64, total_in: u64, vsize: usize, force: bool) -> Result<()> {
+    let rate = fee as f64 / vsize.max(1) as f64;
+    if !force && fee > 100_000 && (fee > total_in / 2 || rate > 1000.0) {
+        bail!(
+            "fee of {fee} sat looks like a mistake ({:.1}% of the inputs, {rate:.0} sat/vB). \
+             Use --force if you meant it.",
+            100.0 * fee as f64 / total_in.max(1) as f64
+        );
+    }
+    Ok(())
+}
+
+pub fn output_info(tx: &Transaction, net: Network) -> Vec<OutputInfo> {
+    tx.output
         .iter()
         .enumerate()
         .map(|(index, o)| OutputInfo {
@@ -533,7 +677,33 @@ pub fn outcome(psbt: &Psbt, net: Network, mut notes: Vec<String>) -> Result<Outc
             script_pubkey: hx(o.script_pubkey.as_bytes()),
             amount_sat: o.value.to_sat(),
         })
-        .collect();
+        .collect()
+}
+
+/// Summarise a PSBT; if every signature is present, finalise it and verify
+/// the result. A transaction that fails verification is never returned.
+/// `force` accepts a fee that looks like a mistake.
+pub fn outcome(psbt: &Psbt, net: Network, notes: Vec<String>, force: bool) -> Result<Outcome> {
+    outcome_for(psbt, net, notes, force, false)
+}
+
+/// `outcome`, for a PSBT that `build` just made from the user's own spec.
+pub(crate) fn outcome_for(
+    psbt: &Psbt,
+    net: Network,
+    mut notes: Vec<String>,
+    force: bool,
+    own_spec: bool,
+) -> Result<Outcome> {
+    check_shape(&psbt.unsigned_tx)?;
+    let signatures = status_for(psbt, own_spec)?;
+    let prevouts = utxos(psbt)?;
+    let complete = signatures.iter().all(|s| s.have >= s.need);
+    let (total_in, total_out, fee) = fee_of(&psbt.unsigned_tx, &prevouts)?;
+    let outputs = output_info(&psbt.unsigned_tx, net);
+    for s in &signatures {
+        notes.extend(s.warnings.iter().map(|w| format!("WARNING {w}")));
+    }
     for (n, o) in psbt.unsigned_tx.output.iter().enumerate() {
         let v = o.value.to_sat();
         if !o.script_pubkey.is_op_return() && v > 0 && v < dust_threshold(&o.script_pubkey) {
@@ -556,6 +726,7 @@ pub fn outcome(psbt: &Psbt, net: Network, mut notes: Vec<String>) -> Result<Outc
         fee,
         fee_rate: 0.0,
         outputs,
+        locktime: psbt.unsigned_tx.lock_time.to_consensus_u32(),
         signatures,
         verify: vec![],
         consensus: None,
@@ -575,6 +746,20 @@ pub fn outcome(psbt: &Psbt, net: Network, mut notes: Vec<String>) -> Result<Outc
         consensus_verify(&tx, &prevouts)
             .map_err(|e| err!("refusing to output the transaction: {e}"))?;
         oc.consensus = Some("ok".into());
+        for c in oc.verify.iter().filter(|c| !c.sighash_all) {
+            let w = format!(
+                "WARNING input {}: signed with a sighash that does not commit to the whole \
+                 transaction ({})",
+                c.index, c.note
+            );
+            if !oc
+                .notes
+                .iter()
+                .any(|n| n.starts_with(&format!("WARNING input {}:", c.index)))
+            {
+                oc.notes.push(w);
+            }
+        }
         oc.vsize = tx.vsize();
         oc.txid = Some(tx.compute_txid().to_string());
         oc.wtxid = Some(tx.compute_wtxid().to_string());
@@ -590,6 +775,20 @@ pub fn outcome(psbt: &Psbt, net: Network, mut notes: Vec<String>) -> Result<Outc
             .collect();
         oc.notes
             .push(format!("NOT fully signed: {}", waiting.join("; ")));
+        if own_spec && oc.signatures.iter().any(|s| !s.amount_verified) {
+            oc.notes.push(
+                "the next signer will be asked to trust the input amounts (--trust-amounts): \
+                 add prev_tx to the spec's inputs and the PSBT carries the proof instead"
+                    .into(),
+            );
+        }
+    }
+    check_fee(fee, total_in, oc.vsize, force)?;
+    // Below check_fee's 100k sat floor nothing is refused, but say so.
+    if fee > total_in / 2 {
+        oc.notes.push(format!(
+            "WARNING the fee ({fee} sat) is more than half of the {total_in} sat being spent"
+        ));
     }
     oc.fee_rate = (fee as f64 / oc.vsize.max(1) as f64 * 100.0).round() / 100.0;
     Ok(oc)
@@ -597,11 +796,20 @@ pub fn outcome(psbt: &Psbt, net: Network, mut notes: Vec<String>) -> Result<Outc
 
 /// Add signatures to a PSBT. A key that signs nothing is an error: it almost
 /// always means the wrong key file was picked up.
-pub fn sign_and_report(psbt: &mut Psbt, keys: &[SecretKey], net: Network) -> Result<Outcome> {
+pub fn sign_and_report(
+    psbt: &mut Psbt,
+    keys: &[SecretKey],
+    net: Network,
+    policy: &Policy,
+) -> Result<Outcome> {
     if keys.is_empty() {
         bail!("no private key given");
     }
-    let counts = sign_psbt(psbt, keys)?;
+    check_shape(&psbt.unsigned_tx)?;
+    // Check the fee before producing any signature, not after.
+    let (total_in, _, fee) = fee_of(&psbt.unsigned_tx, &utxos(psbt)?)?;
+    check_fee(fee, total_in, estimate_vsize(psbt, keys)?, policy.force_fee)?;
+    let counts = sign_psbt(psbt, keys, policy)?;
     if let Some(n) = counts.iter().position(|c| *c == 0) {
         bail!(
             "key #{} (pubkey {}) cannot sign any input of this transaction",
@@ -609,11 +817,11 @@ pub fn sign_and_report(psbt: &mut Psbt, keys: &[SecretKey], net: Network) -> Res
             both_pubkeys(&keys[n])[0]
         );
     }
-    outcome(psbt, net, vec![])
+    outcome(psbt, net, vec![], policy.force_fee)
 }
 
 /// Merge PSBTs of the same transaction that were signed separately.
-pub fn combine(mut psbts: Vec<Psbt>, net: Network) -> Result<Outcome> {
+pub fn combine(mut psbts: Vec<Psbt>, net: Network, force: bool) -> Result<Outcome> {
     if psbts.is_empty() {
         bail!("nothing to combine");
     }
@@ -622,5 +830,5 @@ pub fn combine(mut psbts: Vec<Psbt>, net: Network) -> Result<Outcome> {
         base.combine(other)
             .map_err(|e| err!("cannot combine: {e}"))?;
     }
-    outcome(&base, net, vec![])
+    outcome(&base, net, vec![], force)
 }

@@ -10,7 +10,7 @@ use crate::decode::{decode, parse_psbt, parse_tx_or_psbt, verify, Parsed};
 use crate::keys::{addresses_for_pubkey, key_info, parse_key, parse_pubkey};
 use crate::message::{sign_message, verify_message};
 use crate::script::{dust_threshold, parse_address, Kind, Multisig, Wrap};
-use crate::sign::{combine, ecdsa_sighash, sign_and_report, Outcome};
+use crate::sign::{combine, ecdsa_sighash, sign_and_report, Outcome, Policy};
 use crate::spec::build;
 use crate::verify::{consensus_verify, verify_tx};
 use crate::{hx, secp, unhx, Result};
@@ -247,7 +247,7 @@ pub fn run() -> Vec<Check> {
                 );
                 let raw = oc.raw.clone().unwrap_or_default();
                 t.run(format!("standalone verify {name}"), || {
-                    Ok(verify(&raw, Some(&spec.to_string()))?.valid)
+                    Ok(verify(&raw, Some(&spec.to_string()), net)?.valid)
                 });
                 t.run(format!("signing is deterministic {name}"), || {
                     Ok(built(spec)?.raw == oc.raw)
@@ -299,7 +299,12 @@ pub fn run() -> Vec<Check> {
         let oc = mixed_oc.clone()?;
         let mut wrong = mixed.clone();
         wrong["inputs"][1]["amount_sat"] = json!(60_001);
-        Ok(!verify(oc.raw.as_deref().unwrap_or(""), Some(&wrong.to_string()))?.valid)
+        Ok(!verify(
+            oc.raw.as_deref().unwrap_or(""),
+            Some(&wrong.to_string()),
+            net,
+        )?
+        .valid)
     });
 
     // --- fee targeting never lands below the requested rate -----------------
@@ -400,6 +405,12 @@ pub fn run() -> Vec<Check> {
     let cosigners = [key(0x1001), key(0x1002), key(0x1003)];
     let pubs: Vec<String> = cosigners.iter().map(pub_hex).collect();
     let khex = |i: usize| hx(&cosigners[i].secret_bytes());
+    // Legacy P2SH carries no proof of its amount unless the previous
+    // transaction is supplied; these flow tests accept that explicitly.
+    let trusting = Policy {
+        trust_amounts: true,
+        ..Policy::default()
+    };
     for wrap in Wrap::ALL {
         let w = wrap.name();
         let spec = |keys: Value| {
@@ -425,7 +436,7 @@ pub fn run() -> Vec<Check> {
             || {
                 let half = built(spec(json!([khex(2)])))?;
                 let mut psbt = parse_psbt(half.psbt.as_deref().unwrap_or(""))?;
-                let oc = sign_and_report(&mut psbt, &[cosigners[0]], net)?;
+                let oc = sign_and_report(&mut psbt, &[cosigners[0]], net, &trusting)?;
                 let direct = built(spec(json!([khex(0), khex(2)])))?;
                 Ok(oc.complete
                     && oc.verify.iter().all(|c| c.ok)
@@ -436,6 +447,7 @@ pub fn run() -> Vec<Check> {
                     && verify(
                         oc.raw.as_deref().unwrap_or(""),
                         Some(&spec(json!([])).to_string()),
+                        net,
                     )?
                     .valid)
             },
@@ -445,7 +457,7 @@ pub fn run() -> Vec<Check> {
             || {
                 let a = parse_psbt(built(spec(json!([khex(1)])))?.psbt.as_deref().unwrap_or(""))?;
                 let b = parse_psbt(built(spec(json!([khex(2)])))?.psbt.as_deref().unwrap_or(""))?;
-                let oc = combine(vec![a, b], net)?;
+                let oc = combine(vec![a, b], net, false)?;
                 Ok(oc.complete && oc.raw == built(spec(json!([khex(1), khex(2)])))?.raw)
             },
         );
@@ -454,7 +466,7 @@ pub fn run() -> Vec<Check> {
             || {
                 let mut psbt =
                     parse_psbt(built(spec(json!([khex(0)])))?.psbt.as_deref().unwrap_or(""))?;
-                sign_and_report(&mut psbt, &[key(0x9999)], net)
+                sign_and_report(&mut psbt, &[key(0x9999)], net, &trusting)
             },
         );
         t.refuses(
@@ -474,7 +486,7 @@ pub fn run() -> Vec<Check> {
                     .find(|p| *p != pk)
                     .unwrap();
                 psbt.inputs[0].partial_sigs.insert(other, sig); // key 0's signature filed under another key
-                crate::sign::outcome(&psbt, net, vec![])
+                crate::sign::outcome(&psbt, net, vec![], false)
             },
         );
     }
@@ -503,6 +515,277 @@ pub fn run() -> Vec<Check> {
                         "multisig": {"threshold": 2, "pubkeys": pubs}}],
             "outputs": [{"address": ad.p2wpkh, "amount_sat": "all"}]}))
     });
+
+    // --- a PSBT from someone else is not trusted ---------------------------
+    let strict = Policy::default();
+    let ms_spec = |w: &str, extra: Value| {
+        let mut input = json!({"txid": txid('f'), "vout": 3, "amount_sat": 400_000,
+                               "multisig": {"threshold": 2, "pubkeys": pubs, "type": w}});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"network": "mainnet", "keys": [khex(0)], "fee_rate": 9, "inputs": [input],
+               "outputs": [{"address": ad.p2wpkh, "amount_sat": 150_000}], "change_address": ad.p2tr})
+    };
+    let half = |spec: Value| -> Result<bitcoin::psbt::Psbt> {
+        parse_psbt(built(spec)?.psbt.as_deref().unwrap_or(""))
+    };
+    for (name, ty) in [("NONE", 2u32), ("SINGLE", 3), ("ALL|ANYONECANPAY", 0x81)] {
+        t.refuses(
+            &format!("sign refuses a PSBT asking for SIGHASH_{name}"),
+            || {
+                let mut psbt = half(ms_spec("p2wsh", json!({})))?;
+                psbt.inputs[0].sighash_type = Some(bitcoin::psbt::PsbtSighashType::from_u32(ty));
+                // amounts trusted, so that the sighash is the only reason to refuse
+                sign_and_report(&mut psbt, &[cosigners[1]], net, &trusting)
+            },
+        );
+    }
+    t.run(
+        "a non-ALL sighash is signed only on request, and then flagged",
+        || {
+            let mut psbt = half(ms_spec("p2wsh", json!({})))?;
+            psbt.inputs[0].sighash_type = Some(bitcoin::psbt::PsbtSighashType::from_u32(0x81));
+            let allow = Policy {
+                allow_sighash: true,
+                ..trusting
+            };
+            let oc = sign_and_report(&mut psbt, &[cosigners[1]], net, &allow)?;
+            Ok(oc
+                .notes
+                .iter()
+                .any(|n| n.starts_with("WARNING") && n.contains("0x81")))
+        },
+    );
+    t.refuses("never signs SIGHASH_SINGLE without a matching output (replayable signature)", || {
+        // two legacy inputs, one output: input 1 would sign the constant hash "1"
+        let spec = json!({"key": kh, "inputs": [
+            {"txid": txid('a'), "vout": 0, "amount_sat": 50_000, "address": ad.p2pkh},
+            {"txid": txid('b'), "vout": 0, "amount_sat": 50_000, "address": ad.p2pkh, "sighash": 3}],
+            "outputs": [{"address": ad.p2wpkh, "amount_sat": 99_000}]});
+        built(spec)
+    });
+    t.refuses(
+        "sign refuses a legacy input whose amount nothing proves",
+        || {
+            let mut psbt = half(ms_spec("p2sh", json!({})))?;
+            sign_and_report(&mut psbt, &[cosigners[1]], net, &strict)
+        },
+    );
+    t.run(
+        "a legacy input is signed without override when prev_tx proves the amount",
+        || {
+            let ms = Multisig::new(
+                2,
+                pubs.iter()
+                    .map(|p| parse_pubkey(p))
+                    .collect::<Result<_>>()?,
+                true,
+            )?;
+            let prev = bitcoin::Transaction {
+                version: bitcoin::transaction::Version(2),
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn::default()],
+                output: vec![TxOut {
+                    value: Amount::from_sat(400_000),
+                    script_pubkey: ms.script_pubkey(Wrap::P2sh)?,
+                }],
+            };
+            let mut spec = ms_spec(
+                "p2sh",
+                json!({"prev_tx": bitcoin::consensus::encode::serialize_hex(&prev)}),
+            );
+            spec["inputs"][0]["txid"] = json!(prev.compute_txid().to_string());
+            spec["inputs"][0]["vout"] = json!(0);
+            let mut lying = spec.clone();
+            lying["inputs"][0]["amount_sat"] = json!(1_000);
+            let mut psbt = half(spec)?;
+            let oc = sign_and_report(&mut psbt, &[cosigners[1]], net, &strict)?;
+            Ok(oc.complete && oc.signatures[0].amount_verified && built(lying).is_err())
+        },
+    );
+    t.refuses(
+        "sign refuses a segwit v0 input whose amount nothing proves",
+        || {
+            let mut psbt = half(ms_spec("p2wsh", json!({})))?;
+            sign_and_report(&mut psbt, &[cosigners[1]], net, &strict)
+        },
+    );
+    t.run(
+        "a segwit v0 input is signed without override when prev_tx proves the amount",
+        || {
+            let ms = Multisig::new(
+                2,
+                pubs.iter()
+                    .map(|p| parse_pubkey(p))
+                    .collect::<Result<_>>()?,
+                true,
+            )?;
+            let prev = bitcoin::Transaction {
+                version: bitcoin::transaction::Version(2),
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn::default()],
+                output: vec![TxOut {
+                    value: Amount::from_sat(400_000),
+                    script_pubkey: ms.script_pubkey(Wrap::P2wsh)?,
+                }],
+            };
+            let mut spec = ms_spec(
+                "p2wsh",
+                json!({"prev_tx": bitcoin::consensus::encode::serialize_hex(&prev)}),
+            );
+            spec["inputs"][0]["txid"] = json!(prev.compute_txid().to_string());
+            spec["inputs"][0]["vout"] = json!(0);
+            let mut psbt = half(spec)?;
+            let oc = sign_and_report(&mut psbt, &[cosigners[1]], net, &strict)?;
+            Ok(oc.complete && oc.signatures[0].amount_verified && oc.notes.is_empty())
+        },
+    );
+    t.run(
+        "an unproven segwit v0 amount is flagged when signed on trust",
+        || {
+            let mut psbt = half(ms_spec("p2wsh", json!({})))?;
+            let oc = sign_and_report(&mut psbt, &[cosigners[1]], net, &trusting)?;
+            Ok(!oc.signatures[0].amount_verified
+                && oc.notes.iter().any(|n| n.contains("taken on trust")))
+        },
+    );
+    t.run("a taproot input needs no proof of its amount", || {
+        let oc = built(json!({"fee_rate": 2,
+            "inputs": [{"txid": txid('a'), "vout": 0, "amount_sat": 50_000, "address": ad.p2tr}],
+            "outputs": [{"address": ad.p2wpkh, "amount_sat": "all"}]}))?;
+        let mut psbt = parse_psbt(oc.psbt.as_deref().unwrap_or(""))?;
+        let oc = sign_and_report(&mut psbt, &[k], net, &strict)?;
+        Ok(oc.complete && oc.notes.is_empty())
+    });
+    t.run(
+        "decode does not call a PSBT complete on a claimed final signature",
+        || {
+            let mut psbt = half(ms_spec("p2wsh", json!({})))?;
+            psbt.inputs[0].final_script_witness = Some(bitcoin::Witness::from_slice(&[[1u8; 72]]));
+            let d = decode(&psbt.to_string(), net)?;
+            Ok(d["complete"] == false
+                && d["warnings"].as_array().is_some_and(|w| {
+                    w.iter()
+                        .any(|x| x.as_str().is_some_and(|s| s.contains("do NOT verify")))
+                }))
+        },
+    );
+    t.refuses("decode refuses output amounts that would overflow", || {
+        let out = TxOut {
+            value: Amount::from_sat(u64::MAX),
+            script_pubkey: ScriptBuf::new(),
+        };
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![out.clone(), out],
+        };
+        decode(&bitcoin::consensus::encode::serialize_hex(&tx), net)
+    });
+    t.run(
+        "a private key in the wrong spec field is never echoed",
+        || {
+            let wif = key_info(&k, net)?.wif_compressed;
+            let wrong_type =
+                built(json!({"inputs": [{"txid": txid('a'), "vout": wif, "amount_sat": 1}]}));
+            let as_address = built(json!({"inputs": [
+            {"txid": txid('a'), "vout": 0, "amount_sat": 1, "address": wif}]}));
+            let as_network = built(json!({"network": kh, "inputs": one_in(5000)}));
+            Ok([wrong_type, as_address, as_network]
+                .iter()
+                .all(|r| matches!(r, Err(e) if !e.0.contains(&wif) && !e.0.contains(&kh))))
+        },
+    );
+    t.ok(
+        "a spec that names a key twice is refused",
+        matches!(build(r#"{"inputs": [], "change_address": "a", "change_address": "b"}"#, false),
+                 Err(e) if e.0.contains("twice"))
+            && matches!(build(r#"{"_c": 1, "_c": 2, "inputs": []}"#, false),
+                 Err(e) if e.0.contains("no inputs")),
+    );
+    t.run("a 32-byte key is inspected as taproot only", || {
+        let v = crate::keys::inspect(&pub_hex(&k)[2..], net)?;
+        Ok(v["p2tr"] == json!(ad.p2tr) && v.get("p2wpkh").is_none() && v.get("p2pkh").is_none())
+    });
+    t.run("build warns that a legacy amount is unverified", || {
+        let oc = built(json!({"key": kh, "fee_rate": 2,
+            "inputs": [{"txid": txid('a'), "vout": 0, "amount_sat": 50_000, "address": ad.p2pkh}],
+            "outputs": [{"address": ad.p2wpkh, "amount_sat": "all"}]}))?;
+        Ok(
+            oc.notes.iter().any(|n| n.contains("NOT verified"))
+                && !oc.signatures[0].amount_verified,
+        )
+    });
+    t.refuses("sign refuses an absurd fee", || {
+        let mut spec = ms_spec("p2wsh", json!({}));
+        spec["inputs"][0]["amount_sat"] = json!(900_000_000u64);
+        spec.as_object_mut().unwrap().remove("change_address");
+        spec["keys"] = json!([]);
+        let mut psbt = parse_psbt(
+            build(&spec.to_string(), true)?
+                .psbt
+                .as_deref()
+                .unwrap_or(""),
+        )?;
+        sign_and_report(&mut psbt, &[cosigners[1]], net, &strict)
+    });
+    t.refuses(
+        "refuses a fee that is small in percent but absurd in rate",
+        || {
+            built(json!({"key": kh, "inputs": one_in(1_000_000_000),
+                     "outputs": [{"address": ad.p2wpkh, "amount_sat": 600_000_000}]}))
+        },
+    );
+    t.refuses("refuses amounts that would overflow", || {
+        built(json!({"key": kh, "fee_rate": 1, "inputs": [
+            {"txid": txid('a'), "vout": 0, "amount_sat": u64::MAX, "address": ad.p2wpkh},
+            {"txid": txid('b'), "vout": 0, "amount_sat": 2001, "address": ad.p2wpkh}],
+            "outputs": [{"address": ad.p2wpkh, "amount_sat": 1000}]}))
+    });
+    t.refuses("verify refuses a transaction with no inputs", || {
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx)?;
+        verify(&psbt.to_string(), None, net)
+    });
+    t.refuses("refuses an input listed twice", || {
+        built(
+            json!({"key": kh, "fee_rate": 1, "inputs": [one_in(5000)[0], one_in(5000)[0]],
+                     "outputs": [{"address": ad.p2wpkh, "amount_sat": "all"}]}),
+        )
+    });
+    t.refuses("refuses script_pubkey and address that disagree", || {
+        built(json!({"key": kh, "inputs": one_in(100_000), "outputs": [
+            {"address": ad.p2wpkh, "script_pubkey": "0014".to_string() + &"11".repeat(20), "amount_sat": 99_000}]}))
+    });
+    t.refuses("multisig refuses an x-only (32-byte) public key", || {
+        crate::script::multisig_info(1, &[pubs[0][2..].to_string()], "p2wsh", true, net)
+    });
+    t.run(
+        "verify reports what the transaction pays, and its fee",
+        || {
+            let oc = mixed_oc.clone()?;
+            let r = verify(
+                oc.raw.as_deref().unwrap_or(""),
+                Some(&mixed.to_string()),
+                net,
+            )?;
+            Ok(r.valid
+                && r.fee == oc.fee
+                && r.outputs.len() == oc.outputs.len()
+                && r.warnings.iter().any(|w| w.contains("on trust")))
+        },
+    );
 
     // --- message signing -------------------------------------------------------
     for (name, addr) in [

@@ -80,6 +80,7 @@
   <nav>
     <a class="brand" href="#"><img src="assets/icon.png" alt="">btc-keytool</a>
     <a href="#verify">Verification</a>
+    <a href="#psbt">Hostile PSBTs</a>
     <a href="#multisig">Multisig</a>
     <a href="#install">Install</a>
     <a href="https://github.com/rsantacroce/btc-keytool">GitHub</a>
@@ -130,10 +131,46 @@
         P2WSH, P2SH-P2WSH and legacy P2SH.</p></div>
       <div class="card"><h3>Guard rails</h3><p>Refuses a key that does not match its input, an overspend, a fat-finger fee,
         and a misspelled spec field that would otherwise turn your change into fee.</p></div>
+      <div class="card"><h3>Distrusts the PSBT</h3><p>A PSBT from someone else cannot make you sign with a sighash that lets
+        the outputs be rewritten, or hide the real fee behind an input amount nothing proves.
+        <a href="#psbt">See the list.</a></p></div>
       <div class="card"><h3>Decode and verify</h3><p>Inspect any raw transaction or PSBT: outputs, fee, who has signed,
         who has not.</p></div>
       <div class="card"><h3>Message signing</h3><p>Sign and verify text messages (BIP137) to prove control of an address.</p></div>
+      <div class="card"><h3>Deterministic signatures</h3><p>Nonces come from RFC 6979 and BIP340, not a random number generator,
+        so a weak one cannot leak a key. New keys use the operating system's entropy source.</p></div>
     </div>
+  </section>
+
+  <section id="psbt">
+    <h2>A PSBT from someone else is treated as hostile</h2>
+    <p class="sub">It may come from a cosigner whose machine is compromised, or from someone who wants your signature
+      for something other than what they say. <code>sign</code> refuses by default, and each override is a flag you
+      have to type.</p>
+    <div class="scroll"><table>
+      <tr><th>What the PSBT tries</th><th>What happens</th></tr>
+      <tr><td><strong>A sighash type other than ALL</strong>, so the outputs can be rewritten after you sign</td>
+        <td>Refused. <code>--allow-sighash</code> overrides, and the result is flagged in every later decode and verify.
+        The desktop app never signs one.</td></tr>
+      <tr><td><strong>SIGHASH_SINGLE with no matching output</strong>, which yields a signature valid for any spend of
+        that key</td><td>Refused always. There is no override.</td></tr>
+      <tr><td><strong>An input amount nothing proves</strong>. A legacy signature does not cover the amount at all. A
+        segwit v0 signature covers only its own input, so two signed versions of one transaction, each understating a
+        different input, can be spliced into one that burns the difference as fee.</td>
+        <td>Refused unless the PSBT carries the previous transaction. <code>--trust-amounts</code> overrides and the
+        result carries a warning. Taproot inputs are exempt: their signatures commit to every amount.</td></tr>
+      <tr><td><strong>A fee that looks like a mistake</strong>: above 100k sat and over half the inputs or over
+        1000 sat/vB</td><td>Refused before any signature is made. <code>--force</code> overrides. Below that floor, a
+        fee over half the inputs still gets a warning.</td></tr>
+      <tr><td><strong>Signing unseen</strong></td><td>At a terminal, <code>sign</code> shows the outputs and the fee and
+        asks. With nobody at the terminal it refuses without <code>--yes</code>. The desktop app shows the review on the
+        first press of Sign and signs on the second.</td></tr>
+      <tr><td><strong>Inputs marked as already signed</strong> that are not</td><td>A PSBT is only reported complete
+        if the finished transaction verifies.</td></tr>
+      <tr><td><strong>Impossible amounts</strong>, no inputs, the same input twice</td><td>Refused.</td></tr>
+    </table></div>
+    <p class="sub">Your own spec gets the same care in a different place: a misspelled field or a key named twice is an
+      error, and a private key typed into the wrong field is never repeated in the error message.</p>
   </section>
 
   <section id="multisig">
@@ -146,7 +183,8 @@
 btc-keytool multisig -k 2 \
   -p 02aa… -p 03bb… -p 02cc…
 
-<span class="c"># 2. build the spend; with no keys you get a PSBT</span>
+<span class="c"># 2. build the spend; with no keys you get a PSBT
+#    (give prev_tx in the spec: it proves the amount)</span>
 btc-keytool build spend.json -o spend.psbt
 
 <span class="c"># 3. each cosigner reviews, then signs</span>
@@ -168,6 +206,8 @@ btc-keytool combine alice.psbt bob.psbt \
             it both ways and prints raw hex instead of a PSBT.</li>
           <li><strong>A key that is not a cosigner is refused</strong>, and a signature filed under the wrong key is
             detected.</li>
+          <li><strong>Put <code>prev_tx</code> on the input</strong> and the PSBT proves what it spends. Without it,
+            each cosigner has to pass <code>--trust-amounts</code>.</li>
           <li>Not supported: taproot script-path multisig (<code>multi_a</code>) and MuSig.</li>
         </ul>
       </div>
@@ -212,7 +252,7 @@ cargo tauri build</pre>
       </div>
       <div>
         <h3>Check the build before trusting it</h3>
-        <pre><span class="c"># 99 built-in checks: BIP vectors, every input
+        <pre><span class="c"># 124 built-in checks: BIP vectors, every input
 # type, multisig flows, tamper detection</span>
 btc-keytool selftest
 
@@ -228,6 +268,12 @@ cargo test --workspace</pre>
     <h2>Before you use it with real funds</h2>
     <ul class="plain">
       <li><strong>This software has not had an independent security audit.</strong> Test with small amounts or on testnet first.</li>
+      <li><strong>It has had an internal, AI-assisted code review</strong> (November 2026). Key generation and nonce
+        handling held up. The review found that segwit v0 input amounts were trusted without proof, and that a 32-byte
+        key given to <code>addr</code> produced legacy and segwit addresses that might not be spendable; both are fixed,
+        along with the smaller items in <a href="#psbt">the list above</a>. That is not a substitute for an independent audit.</li>
+      <li><strong>Private keys are not wiped from memory</strong>, a key passed as an argument is visible in
+        <code>ps</code> and shell history (use <code>--key-file</code>), and Copy in the app puts a key on the system clipboard.</li>
       <li><strong>A signed transaction is bearer-spendable.</strong> Anyone holding the hex can broadcast it.</li>
       <li><strong>It works on individual keys</strong> and never asks for or stores a seed phrase. Nothing is written to
         disk unless you pass <code>-o</code>.</li>

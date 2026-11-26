@@ -12,6 +12,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [profile.release]
+# amounts are money: an arithmetic overflow must stop the program, not wrap
+overflow-checks = true
 opt-level = 3
 lto = true
 strip = true
